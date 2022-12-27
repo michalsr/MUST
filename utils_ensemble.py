@@ -384,9 +384,9 @@ def save_model(args, epoch, model, model_without_ddp, optimizer, loss_scaler=Non
             'epoch': epoch,
             'args': args,
         }
-    if not args.supervised:
-        if model_ema is not None:
-            to_save['model_ema'] = get_state_dict(model_ema.ema)
+
+    if model_ema is not None:
+        to_save['model_ema'] = get_state_dict(model_ema.ema)
 
     save_on_master(to_save, checkpoint_path)
     

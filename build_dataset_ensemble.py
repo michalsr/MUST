@@ -14,16 +14,24 @@ import os
 import os.path
 import torch
 import json
+from transformers import CLIPTokenizer
+from transformers import AutoTokenizer
 
 from torchvision import datasets, transforms
 from torchvision.transforms.functional import InterpolationMode 
 from torch.utils.data import Dataset
+from unicl.constants import IMAGENET_CLASSES
+from unicl.constants import prompt_engineering
+import os
+import os.path
+from typing import Any, Callable, cast, Dict, List, Optional, Tuple, Union
 
+from PIL import Image
 from timm.data import create_transform
 
 from PIL import Image
 import numpy as np
-
+from unicl.text_encoder import build_tokenizer 
 import random
 
 def pil_loader(path: str) -> Image.Image:
@@ -36,6 +44,77 @@ import random
 import math
 import numpy as np
 
+
+IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".ppm", ".bmp", ".pgm", ".tif", ".tiff", ".webp")
+
+
+def pil_loader(path: str) -> Image.Image:
+    # open path as file to avoid ResourceWarning (https://github.com/python-pillow/Pillow/issues/835)
+    with open(path, "rb") as f:
+        img = Image.open(f)
+        return img.convert("RGB")
+
+
+# TODO: specify the return type
+def accimage_loader(path: str) -> Any:
+    import accimage
+
+    try:
+        return accimage.Image(path)
+    except OSError:
+        # Potentially a decoding problem, fall back to PIL.Image
+        return pil_loader(path)
+
+
+def default_loader(path: str) -> Any:
+    from torchvision import get_image_backend
+
+    if get_image_backend() == "accimage":
+        return accimage_loader(path)
+    else:
+        return pil_loader(path)
+
+
+class TextImageFolder(torchvision.datasets.ImageFolder):
+    def __init__(
+        self,
+        root: str,
+        transform: Optional[Callable] = None,
+        target_transform: Optional[Callable] = None,
+        loader: Callable[[str], Any],
+        unicl_config = None ):
+        super().__init__(
+            root,
+            loader=loader,
+            transform=transform,
+            target_transform=target_transform,,
+        )
+        self.imgs = self.samples
+        self.config = unicl_config
+        self.tokenizer = build_tokenizer(self.config)
+    def __getitem__(self,index):
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+        text = self._decode_text_from_label(target)
+        tokens = self.tokenizer(
+            text, padding='max_length', 
+            truncation=True, 
+            max_length=77,
+            return_tensors='pt'
+        ) if self.tokenizer else text
+        tokens['input_ids'].squeeze_()
+        tokens['attention_mask'].squeeze_()
+        return sample, tokens, target
+    def __len__(self):
+        return len(self.samples)
+    def _decode_text_from_label(self, label):
+        concept = IMAGENET_CLASSES[int(label)]
+        text = prompt_engineering(concept)
+        return text
 
 class MaskGenerator:
     def __init__(self, input_size, mask_patch_size, model_patch_size, mask_ratio):
@@ -83,22 +162,32 @@ class DataAugmentation:
         return images_weak, images_strong, self.mask_generator()
     
     
-class FileListDataset(Dataset):
-    def __init__(self, image_file, label_file, transform=None, target_transform=None):
+class FileListDatasetText(Dataset):
+    def __init__(self, image_file, label_file,  unicl_config = None,transform=None, target_transform=None):
         self.transform = transform
         self.target_transform = target_transform
         self.images = np.load(image_file)
         self.labels = np.load(label_file)
+        self.config = unicl_config
+        self.tokenizer = build_tokenizer(self.config)
 
     def __getitem__(self, index):
-        image = pil_loader(self.images[index])
-        target = self.labels[index]
-
+        path, target = self.samples[index]
+        sample = self.loader(path)
         if self.transform is not None:
-            sample = self.transform(image)
-
+            sample = self.transform(sample)
         if self.target_transform is not None:
             target = self.target_transform(target)
+        text = self._decode_text_from_label(target)
+        tokens = self.tokenizer(
+            text, padding='max_length', 
+            truncation=True, 
+            max_length=77,
+            return_tensors='pt'
+        ) if self.tokenizer else text
+        tokens['input_ids'].squeeze_()
+        tokens['attention_mask'].squeeze_()
+        return sample, tokens, target
 
         return sample, target
 
@@ -150,53 +239,26 @@ def build_dataset(is_train, args, train_config=None):
 def build_transform(is_train, args, train_config=None):
 
     if is_train:
-        if args.supervised:
-            weak_transform = transforms.Compose([
-                transforms.Resize(args.input_size, interpolation=InterpolationMode.BICUBIC),       
-                transforms.RandomCrop(args.input_size), 
-                transforms.RandomHorizontalFlip(), 
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=torch.tensor(args.image_mean),
-                    std=torch.tensor(args.image_std))
-            ])
-            
-            strong_transform = transforms.Compose([
-                transforms.Resize(args.input_size, interpolation=InterpolationMode.BICUBIC),       
-                transforms.RandomCrop(args.input_size), 
-                transforms.RandomHorizontalFlip(), 
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=torch.tensor(args.image_mean),
-                    std=torch.tensor(args.image_std))
-            ])
-            transform = DataAugmentation(weak_transform, strong_transform, args, train_config)
-
-
-
-        else:
-            
-            weak_transform = transforms.Compose([
-                transforms.Resize(args.input_size, interpolation=InterpolationMode.BICUBIC),       
-                transforms.RandomCrop(args.input_size),  
-                transforms.ToTensor(),
-                transforms.Normalize(
-                    mean=torch.tensor(args.image_mean),
-                    std=torch.tensor(args.image_std))
-            ])
-            
-            strong_transform = create_transform(
-                input_size=args.input_size,
-                scale=(args.train_crop_min,1),
-                is_training=True,
-                color_jitter=args.color_jitter,
-                auto_augment=args.aa,
-                interpolation=args.train_interpolation,
-                mean=args.image_mean,
-                std=args.image_std
-            )          
-            transform = DataAugmentation(weak_transform, strong_transform, args, train_config)
-
+        weak_transform = transforms.Compose([
+            transforms.Resize(args.input_size, interpolation=InterpolationMode.BICUBIC),       
+            transforms.RandomCrop(args.input_size),  
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=torch.tensor(args.image_mean),
+                std=torch.tensor(args.image_std))
+        ])
+         
+        strong_transform = create_transform(
+            input_size=args.input_size,
+            scale=(args.train_crop_min,1),
+            is_training=True,
+            color_jitter=args.color_jitter,
+            auto_augment=args.aa,
+            interpolation=args.train_interpolation,
+            mean=args.image_mean,
+            std=args.image_std
+        )          
+        transform = DataAugmentation(weak_transform, strong_transform, args, train_config)
 
         return transform
     

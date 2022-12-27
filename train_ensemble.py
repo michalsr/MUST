@@ -26,14 +26,13 @@ from collections import OrderedDict
 from ema import ModelEma
 from optim_factory import create_optimizer, get_parameter_groups, LayerDecayValueAssigner
 
-import utils
-from utils import NativeScalerWithGradNormCount as NativeScaler
+import utils_ensemble
+from utils_ensemble import NativeScalerWithGradNormCount as NativeScaler
 
-from build_dataset import build_dataset
-from engine_self_training import train_one_epoch, evaluate
-from supervised import train_one_epoch as supervised_train_one_epoch 
-from supervised import evaluate as supervised_evaluate
-from model import clip_classifier
+from build_dataset_ensemble import build_dataset
+from ensemble_engine_self_training import train_one_epoch, evaluate
+
+from ensemble_model import Ensemble_CLIP
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -119,13 +118,12 @@ def get_args():
     parser.add_argument('--amp', action='store_true')
     parser.add_argument('--self_train_real_labels', action='store_true')
     parser.add_argument('--url',default=None)
-    parser.add_argument('--supervised',action='store_true')
 
     return parser.parse_args()
 
 
 def main(args):
-    utils.init_distributed_mode(args)
+    utils_ensemble.init_distributed_mode(args)
 
     train_configs = json.load(open(args.train_config,'r'))
     train_config = train_configs[args.dataset+'_'+args.clip_model]
@@ -144,7 +142,7 @@ def main(args):
     device = torch.device(args.device)
 
     # fix the seed for reproducibility
-    seed = args.seed + utils.get_rank()
+    seed = args.seed + utils_ensemble.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
@@ -152,15 +150,15 @@ def main(args):
     cudnn.benchmark = True
     
     # create image classifier from pretrained clip model
-    model = clip_classifier(args)
+    model = Ensemble_CLIP(args,unicl_config)
     args.nb_classes = len(model.classnames)
 
     dataset_train = build_dataset(is_train=True, args=args, train_config=train_config)
     dataset_val = build_dataset(is_train=False, args=args)
 
     if  True: #args.distributed:
-        num_tasks = utils.get_world_size()
-        global_rank = utils.get_rank()
+        num_tasks = utils_ensemble.get_world_size()
+        global_rank = utils_ensemble.get_rank()
         sampler_train = torch.utils.data.DistributedSampler(
             dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
         )
@@ -173,10 +171,10 @@ def main(args):
     
     if global_rank == 0 and args.output_dir is not None:
         os.makedirs(args.output_dir, exist_ok=True)
-        log_writer = utils.TensorboardLogger(log_dir=args.output_dir)
+        log_writer = utils_ensemble.TensorboardLogger(log_dir=args.output_dir)
     else:
         log_writer = None
-    if args.output_dir and utils.is_main_process():    
+    if args.output_dir and utils_ensemble.is_main_process():    
         with open(os.path.join(args.output_dir, "log.txt"), mode="a", encoding="utf-8") as f:
             f.write(json.dumps(dict(args._get_kwargs())) + "\n")
                 
@@ -195,22 +193,24 @@ def main(args):
         pin_memory=True,
         drop_last=False
     )
-    if args.supervised:
-        model_ema = model 
-    else:
-        model_ema = ModelEma(
-            model,
-            decay=args.model_ema_decay,
-            resume='')
-        print("Using EMA with decay = %.5f" % (args.model_ema_decay) )
 
-    model_without_ddp = model
-    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    model_ema = ModelEma(
+        model,
+        decay=args.model_ema_decay,
+        resume='')
+    print("Using EMA with decay = %.5f" % (args.model_ema_decay) )
 
-    print("Model = %s" % str(model_without_ddp))
-    print('number of params:', n_parameters)
+    model_without_ddp_must = model.must 
+    model_without_ddp_unicl = model.unicl 
+    n_parameters_must = sum(p.numel() for p in model.must.parameters() if p.requires_grad)
+    n_parameters_unicl = sum(p.numel() for p in model.unicl.parameters() if p.requires_grad)
+    print("Model = %s" % str(model_without_ddp_must))
+    print("Model = %s" % str(model_without_ddp_unicl))
+    print('number of params must:', n_parameters_must)
+    print('number of params must:', n_parameters_unicl)
+    
 
-    total_batch_size = args.batch_size * utils.get_world_size()
+    total_batch_size = args.batch_size * utils_ensemble.get_world_size()
     num_training_steps_per_epoch = len(data_loader_train)
 
     args.lr = train_config['lr'] * total_batch_size / 256
@@ -221,7 +221,7 @@ def main(args):
     print("Batch size = %d" % total_batch_size)
     print("Number of training examples = %d" % len(dataset_train))
 
-    num_layers = model_without_ddp.model.visual.transformer.layers
+    num_layers = model_without_ddp.model.must.visual.transformer.layers
     if args.layer_decay < 1.0:
         assigner = LayerDecayValueAssigner(list(args.layer_decay ** (num_layers + 1 - i) for i in range(num_layers + 2)))
     else:
@@ -245,12 +245,12 @@ def main(args):
         loss_scaler = None
         amp_autocast = suppress
 
-    lr_schedule_values = utils.cosine_scheduler(
+    lr_schedule_values = utils_ensemble.cosine_scheduler(
         args.lr, args.min_lr, args.epochs, num_training_steps_per_epoch,
         warmup_epochs=args.warmup_epochs, warmup_steps=args.warmup_steps,
     )
 
-    utils.auto_load_model(
+    utils_ensemble.auto_load_model(
         args=args, model=model, model_without_ddp=model_without_ddp,
         optimizer=optimizer, loss_scaler=loss_scaler, model_ema=model_ema)
     
@@ -270,38 +270,23 @@ def main(args):
             data_loader_train.sampler.set_epoch(epoch)
         if log_writer is not None:
             log_writer.set_step(epoch * num_training_steps_per_epoch)
-        if args.supervised:
-            train_stats = supervised_train_one_epoch(model, args, train_config,
-                data_loader_train, optimizer, amp_autocast, device, epoch, loss_scaler, 
-                log_writer=log_writer,
-                start_steps=epoch * num_training_steps_per_epoch,
-                lr_schedule_values=lr_schedule_values,
-                model_ema=None,) 
-
-        else:
-            train_stats = train_one_epoch(
-                model, args, train_config,
-                data_loader_train, optimizer, amp_autocast, device, epoch, loss_scaler, 
-                log_writer=log_writer,
-                start_steps=epoch * num_training_steps_per_epoch,
-                lr_schedule_values=lr_schedule_values,
-                model_ema=model_ema,
-            )        
+            
+        train_stats = train_one_epoch(
+            model, args, train_config,
+            data_loader_train, optimizer, amp_autocast, device, epoch, loss_scaler, 
+            log_writer=log_writer,
+            start_steps=epoch * num_training_steps_per_epoch,
+            lr_schedule_values=lr_schedule_values,
+            model_ema=model_ema,
+        )        
         
         if args.output_dir and utils.is_main_process() and (epoch + 1) % args.eval_freq == 0:
             if (epoch + 1) % args.save_ckpt_freq == 0 or epoch + 1 == args.epochs:
-                if args.supervised:
-                    utils.save_model(
-                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                        loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
-                else:
-                    utils.save_model(
-                        args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                        loss_scaler=loss_scaler, epoch=epoch, model_ema=None)
-            if args.supervised:
-                test_stats = supervised_evaluate(data_loader_val, model, device, model_ema=model_ema, args=args)
-            else:
-                test_stats = evaluate(data_loader_val, model, device, model_ema=model_ema, args=args)
+                utils.save_model(
+                    args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+                    loss_scaler=loss_scaler, epoch=epoch, model_ema=model_ema)
+
+            test_stats = evaluate(data_loader_val, model, device, model_ema=model_ema, args=args)
             print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
             if max_accuracy < test_stats["acc1"]:
                 max_accuracy = test_stats["acc1"]
@@ -313,8 +298,7 @@ def main(args):
             print(f'Max accuracy: {max_accuracy:.2f}%')
             if log_writer is not None:
                 log_writer.update(test_acc1=test_stats['acc1'], head="test", step=epoch)
-                if not args.supervised:
-                    log_writer.update(test_ema_acc1=test_stats['ema_acc1'], head="test", step=epoch)
+                log_writer.update(test_ema_acc1=test_stats['ema_acc1'], head="test", step=epoch)
                 log_writer.flush()
                 
             log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
