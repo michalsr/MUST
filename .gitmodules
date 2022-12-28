@@ -1,3 +1,6 @@
 [submodule "vissl"]
 	path = vissl
 	url = https://github.com/facebookresearch/vissl.git
+[submodule "UniCL"]
+	path = UniCL
+	url = https://github.com/microsoft/UniCL.git
